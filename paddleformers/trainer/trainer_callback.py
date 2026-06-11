@@ -788,6 +788,7 @@ class MoECorrectionBiasAdjustCallback(TrainerCallback):
 
         biases = []
         usages = []
+        rates = []
 
         def get_stat(layer):
             if (
@@ -796,6 +797,9 @@ class MoECorrectionBiasAdjustCallback(TrainerCallback):
                 if hasattr(layer, "e_score_correction_bias") and layer.e_score_correction_bias is not None:
                     biases.append(layer.e_score_correction_bias)
                     usages.append(layer.expert_usage)
+                    # Per-layer bias update rate; fall back to global self.update_lr
+                    _r = getattr(layer, "bias_update_rate", None)
+                    rates.append(self.update_lr if _r is None else float(_r))
 
         model.apply(get_stat)
 
@@ -819,7 +823,11 @@ class MoECorrectionBiasAdjustCallback(TrainerCallback):
             dist.all_reduce(usages_tensor, group=sd_group)
 
         usages_mean = usages_tensor.mean(-1, keepdim=True)
-        update = paddle.sign(usages_mean - usages_tensor) * self.update_lr
+        # Per-layer rate vector aligned (same order) with biases/usages via model.apply
+        rate_vec = paddle.to_tensor(rates, dtype=paddle.float32).reshape(
+            [-1] + [1] * (usages_tensor.ndim - 1)
+        )
+        update = paddle.sign(usages_mean - usages_tensor).astype(paddle.float32) * rate_vec
         update = update.astype(paddle.float32)
         update_list = list(update)
 
