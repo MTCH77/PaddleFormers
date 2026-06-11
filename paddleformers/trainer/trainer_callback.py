@@ -805,31 +805,53 @@ class MoECorrectionBiasAdjustCallback(TrainerCallback):
 
         if not usages:
             return
-        usages_tensor = paddle.stack(usages, 0)  # [num_layers, num_local_experts]
-        if not hasattr(fleet, "_hcg"):
-            dist.all_reduce(usages_tensor)
-            return
 
-        hcg = fleet.get_hybrid_communicate_group()
-        mp_group = hcg.get_model_parallel_group()
-        dp_group = hcg.get_data_parallel_group()
-        sd_group = hcg.get_sharding_parallel_group()
+        no_hcg = not hasattr(fleet, "_hcg")
+        if not no_hcg:
+            hcg = fleet.get_hybrid_communicate_group()
+            mp_group = hcg.get_model_parallel_group()
+            dp_group = hcg.get_data_parallel_group()
+            sd_group = hcg.get_sharding_parallel_group()
 
-        if self.use_mp and mp_group.nranks > 1:
-            dist.all_reduce(usages_tensor, group=mp_group)
-        if dp_group.nranks > 1:
-            dist.all_reduce(usages_tensor, group=dp_group)
-        if sd_group.nranks > 1:
-            dist.all_reduce(usages_tensor, group=sd_group)
+        def _reduce_usage(t):
+            if no_hcg:
+                dist.all_reduce(t)
+                return
+            if self.use_mp and mp_group.nranks > 1:
+                dist.all_reduce(t, group=mp_group)
+            if dp_group.nranks > 1:
+                dist.all_reduce(t, group=dp_group)
+            if sd_group.nranks > 1:
+                dist.all_reduce(t, group=sd_group)
 
-        usages_mean = usages_tensor.mean(-1, keepdim=True)
-        # Per-layer rate vector aligned (same order) with biases/usages via model.apply
-        rate_vec = paddle.to_tensor(rates, dtype=paddle.float32).reshape(
-            [-1] + [1] * (usages_tensor.ndim - 1)
-        )
-        update = paddle.sign(usages_mean - usages_tensor).astype(paddle.float32) * rate_vec
-        update = update.astype(paddle.float32)
-        update_list = list(update)
+        # Layers may have different num_local_experts (heterogeneous MoE), in which
+        # case the usage tensors cannot be stacked. Use the batched stack path only
+        # when all layers share the same shape; otherwise process each layer alone.
+        if len({tuple(u.shape) for u in usages}) == 1:
+            usages_tensor = paddle.stack(usages, 0)  # [num_layers, num_local_experts]
+            _reduce_usage(usages_tensor)
+            if no_hcg:
+                return
+            usages_mean = usages_tensor.mean(-1, keepdim=True)
+            # Per-layer rate vector aligned (same order) with biases/usages via model.apply
+            rate_vec = paddle.to_tensor(rates, dtype=paddle.float32).reshape(
+                [-1] + [1] * (usages_tensor.ndim - 1)
+            )
+            update = paddle.sign(usages_mean - usages_tensor).astype(paddle.float32) * rate_vec
+            update = update.astype(paddle.float32)
+            update_list = list(update)
+        else:
+            for usage_i in usages:
+                _reduce_usage(usage_i)
+            if no_hcg:
+                return
+            update_list = []
+            for usage_i, rate_i in zip(usages, rates):
+                usage_mean_i = usage_i.mean(-1, keepdim=True)
+                update_i = (
+                    paddle.sign(usage_mean_i - usage_i).astype(paddle.float32) * rate_i
+                ).astype(paddle.float32)
+                update_list.append(update_i)
 
         # print('on_optimizer_end bias:', [bias.tolist() for bias in biases])
         # print('on_optimizer_end usage:', usages_tensor.tolist())

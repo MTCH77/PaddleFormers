@@ -302,6 +302,9 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
 
             if name in slice_config:
                 slice_fn, slice_kwargs = slice_config[name]
+                if slice_fn.__name__ == "_ffn_gate_up":
+                    # FFN gate/up 各占末维一半；按各参数实际 shape 推导，兼容异构层
+                    slice_kwargs = {**slice_kwargs, "intermediate_size": param.shape[-1] // 2}
                 param_info = MuonParamInfo(
                     use_muon=use_muon,
                     split_concat_func=partial(slice_fn, **slice_kwargs),
