@@ -25,6 +25,23 @@ logger = logging.getLogger(__name__)
 class MiniMaxM2PreTrainedModel(PretrainedModel):
     config: MiniMaxM2Config
 
+    @staticmethod
+    def _resolve_layer_n_routed_experts(config, layer_idx_in_decoder):
+        """Return routed-expert count for a decoder layer, honoring heterogeneous
+        (shallow/deep) MoE. layer_idx_in_decoder is 0-based and excludes head empty
+        layers. Mirrors PaddleFleet gpt_layer_specs._resolve_moe_layer_group."""
+        base = config.n_routed_experts
+        n_shallow = getattr(config, "num_shallow_moe_layers", 0) or 0
+        n_deep = getattr(config, "num_deep_moe_layers", 0) or 0
+        total = config.num_hidden_layers
+        if n_shallow > 0 and layer_idx_in_decoder < n_shallow:
+            v = getattr(config, "shallow_n_routed_experts", None)
+            return v if v is not None else base
+        if n_deep > 0 and layer_idx_in_decoder >= total - n_deep:
+            v = getattr(config, "deep_n_routed_experts", None)
+            return v if v is not None else base
+        return base
+
     @classmethod
     def _build_muon_slice_config(cls, model, config) -> dict:
         """Build declarative slice configuration for Muon optimizer.
@@ -163,7 +180,7 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
         if use_mla and muon_qkv_update_mode == "split_head":
             mla_slice_fn = _mla_per_head
 
-        def _add_layer_slice_config(prefix):
+        def _add_layer_slice_config(prefix, n_routed):
             # Fused QKV weights (non-MLA path)
             if not use_mla and qkv_slice_fn is not None:
                 slice_config[f"{prefix}.self_attn.qkv_proj.weight"] = (qkv_slice_fn, qkv_kwargs.copy())
@@ -192,7 +209,7 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
 
                 # Routed experts (per-expert)
                 if hasattr(config, "n_routed_experts") and config.n_routed_experts > 0:
-                    for expert_idx in range(config.n_routed_experts):
+                    for expert_idx in range(n_routed):
                         slice_config[f"{prefix}.mlp.experts.{expert_idx}.up_gate_proj.weight"] = (
                             ffn_slice_fn,
                             {"intermediate_size": moe_intermediate_size},
@@ -244,7 +261,10 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
 
         # Main layers
         for layer_idx in range(num_hidden_layers):
-            _add_layer_slice_config(f"model.layers.{layer_idx}")
+            _add_layer_slice_config(
+                f"model.layers.{layer_idx}",
+                cls._resolve_layer_n_routed_experts(config, layer_idx),
+            )
 
         # MTP layers
         if config.mtp_num_layers > 0:
@@ -252,9 +272,11 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
         else:
             num_nextn_predict_layers = config.num_nextn_predict_layers if config.num_nextn_predict_layers else 0
         for layer_idx in range(num_nextn_predict_layers):
-            _add_layer_slice_config(f"model.layers.{num_hidden_layers + layer_idx}")
+            _add_layer_slice_config(f"model.layers.{num_hidden_layers + layer_idx}", config.n_routed_experts)
         for layer_idx in range(num_nextn_predict_layers):
-            _add_layer_slice_config(f"model.layers.{num_hidden_layers + layer_idx}.transformer_layer")
+            _add_layer_slice_config(
+                f"model.layers.{num_hidden_layers + layer_idx}.transformer_layer", config.n_routed_experts
+            )
 
         return slice_config
 
@@ -532,6 +554,7 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
             layer_idx_offset = layer_idx + num_head_empty_layers
             prefix = f"model.layers.{layer_idx}"
             prefix_offset = f"{model_prefix}layers.{layer_idx_offset}"
+            n_routed = cls._resolve_layer_n_routed_experts(config, layer_idx)
             if layer_idx >= num_hidden_layers:
                 # for mtp
                 prefix_offset += ".transformer_layer"
@@ -560,7 +583,7 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
                     f"{prefix}.block_sparse_moe.shared_experts.w2.weight^T -> {prefix_offset}.mlp.shared_experts.down_proj.weight",
                 ]
 
-            for expert_id in range(config.n_routed_experts):
+            for expert_id in range(n_routed):
                 if using_sonic_moe:
                     aoa_config["aoa_statements"] += [
                         f"{prefix}.block_sparse_moe.experts.{expert_id}.w1.weight, {prefix}.block_sparse_moe.experts.{expert_id}.w3.weight -> {prefix_offset}.mlp.experts.{expert_id}.up_gate_proj.weight, axis=0",
@@ -573,7 +596,7 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
             if config.moe_expert_fusion or using_sonic_moe:
                 ep_weight1 = []
                 ep_weight2 = []
-                for expert_id in range(num_experts):
+                for expert_id in range(n_routed):
                     ep_weight1.append(f"{prefix}.mlp.experts.{expert_id}.up_gate_proj.weight")
                     ep_weight2.append(f"{prefix}.mlp.experts.{expert_id}.down_proj.weight")
                 group_gemm1 = ",".join(ep_weight1)
@@ -586,7 +609,7 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
                 if config.get("fd_fallback", False):
                     ep_weight1 = []
                     ep_weight2 = []
-                    for expert_id in range(num_experts):
+                    for expert_id in range(n_routed):
                         ep_weight1.append(f"{prefix_offset}.mlp.experts.{expert_id}.up_gate_proj.weight")
                         ep_weight2.append(f"{prefix_offset}.mlp.experts.{expert_id}.down_proj.weight")
                     group1 = ",".join(ep_weight1)
@@ -808,6 +831,7 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
             layer_idx_offset = layer_idx + num_head_empty_layers
             prefix_offset = f"{model_prefix}layers.{layer_idx_offset}"
             prefix = f"model.layers.{layer_idx}"
+            n_routed = cls._resolve_layer_n_routed_experts(config, layer_idx)
             if layer_idx >= num_hidden_layers:
                 # for mtp
                 prefix_offset += ".transformer_layer"
@@ -815,7 +839,7 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
             if config.moe_expert_fusion or using_sonic_moe:
                 ep_weight1 = []
                 ep_weight2 = []
-                for expert_id in range(config.n_routed_experts):
+                for expert_id in range(n_routed):
                     ep_weight1.append(f"{prefix}.mlp.experts.{expert_id}.up_gate_proj.weight")
                     ep_weight2.append(f"{prefix}.mlp.experts.{expert_id}.down_proj.weight")
                 group_gemm1 = ",".join(ep_weight1)
@@ -828,7 +852,7 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
                 if config.get("fd_fallback", False):
                     ep_weight1 = []
                     ep_weight2 = []
-                    for expert_id in range(num_experts):
+                    for expert_id in range(n_routed):
                         ep_weight1.append(f"{prefix_offset}.mlp.experts.{expert_id}.up_gate_proj.weight")
                         ep_weight2.append(f"{prefix_offset}.mlp.experts.{expert_id}.down_proj.weight")
                     group1 = ",".join(ep_weight1)
@@ -860,27 +884,27 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
             if using_sonic_moe:
                 aoa_statements += [
                     f"{prefix_offset}.mlp.experts.{expert_id}.up_gate_proj.weight -> {prefix_offset}.block_sparse_moe.experts.{expert_id}.w1.weight, {prefix_offset}.block_sparse_moe.experts.{expert_id}.w3.weight, axis=0"
-                    for expert_id in range(config.n_routed_experts)
+                    for expert_id in range(n_routed)
                 ]
             else:
                 aoa_statements += [
                     f"{prefix_offset}.mlp.experts.{expert_id}.up_gate_proj.weight -> {prefix_offset}.block_sparse_moe.experts.{expert_id}.w1.weight, {prefix_offset}.block_sparse_moe.experts.{expert_id}.w3.weight, axis=1"
-                    for expert_id in range(config.n_routed_experts)
+                    for expert_id in range(n_routed)
                 ]
 
             if not using_sonic_moe:
                 aoa_statements += (
                     [
                         f"{prefix_offset}.block_sparse_moe.experts.{expert_id}.w1.weight^T -> {prefix}.block_sparse_moe.experts.{expert_id}.w1.weight"
-                        for expert_id in range(config.n_routed_experts)
+                        for expert_id in range(n_routed)
                     ]
                     + [
                         f"{prefix_offset}.block_sparse_moe.experts.{expert_id}.w3.weight^T -> {prefix}.block_sparse_moe.experts.{expert_id}.w3.weight"
-                        for expert_id in range(config.n_routed_experts)
+                        for expert_id in range(n_routed)
                     ]
                     + [
                         f"{prefix_offset}.mlp.experts.{expert_id}.down_proj.weight^T-> {prefix}.block_sparse_moe.experts.{expert_id}.w2.weight"
-                        for expert_id in range(config.n_routed_experts)
+                        for expert_id in range(n_routed)
                     ]
                 )
 
