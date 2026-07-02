@@ -28,9 +28,23 @@ class MiniMaxM2PreTrainedModel(PretrainedModel):
     @staticmethod
     def _resolve_layer_n_routed_experts(config, layer_idx_in_decoder):
         """Return routed-expert count for a decoder layer, honoring heterogeneous
-        (shallow/deep) MoE. layer_idx_in_decoder is 0-based and excludes head empty
-        layers. Mirrors PaddleFleet gpt_layer_specs._resolve_moe_layer_group."""
+        MoE. layer_idx_in_decoder is 0-based and excludes head empty layers.
+        Priority: per_layer_moe_config > shallow/deep groups > global."""
         base = config.n_routed_experts
+
+        # 1) 逐层配置优先（完全忽略三段式）
+        per_layer = getattr(config, "per_layer_moe_config", None)
+        if per_layer is not None:
+            if layer_idx_in_decoder < len(per_layer):
+                layer_cfg = per_layer[layer_idx_in_decoder]
+                # OmegaConf DictConfig 双保险
+                if layer_cfg is not None and not isinstance(layer_cfg, dict):
+                    layer_cfg = dict(layer_cfg)
+                if layer_cfg and layer_cfg.get("n_routed_experts") is not None:
+                    return layer_cfg["n_routed_experts"]
+            return base  # 该层无覆盖，用全局默认
+
+        # 2) 回退：三段式分组
         n_shallow = getattr(config, "num_shallow_moe_layers", 0) or 0
         n_deep = getattr(config, "num_deep_moe_layers", 0) or 0
         total = config.num_hidden_layers
